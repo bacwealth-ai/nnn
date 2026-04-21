@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """
 Duplicate video finder using perceptual frame hashing.
-Usage: python find_duplicate_videos.py "/path/to/folder"
+Keeps the largest file from each duplicate group, moves the rest to a _duplicates folder.
+Usage: python3 find_duplicate_videos.py "/path/to/folder"
 """
 
 import os
 import sys
+import shutil
 import cv2
 import numpy as np
 from pathlib import Path
-from collections import defaultdict
 from itertools import combinations
 
 VIDEO_EXTENSIONS = {'.mp4', '.mov', '.avi', '.mkv', '.m4v', '.wmv', '.flv', '.webm'}
-FRAMES_TO_SAMPLE = 10  # frames sampled per video for comparison
+FRAMES_TO_SAMPLE = 10
 HASH_SIZE = 16
 SIMILARITY_THRESHOLD = 90  # % similarity to consider duplicate
 
@@ -29,12 +30,8 @@ def hash_distance(h1, h2):
     return np.count_nonzero(h1 != h2)
 
 
-def max_hash_bits():
-    return HASH_SIZE * HASH_SIZE
-
-
 def similarity_percent(h1, h2):
-    return (1 - hash_distance(h1, h2) / max_hash_bits()) * 100
+    return (1 - hash_distance(h1, h2) / (HASH_SIZE * HASH_SIZE)) * 100
 
 
 def extract_frame_hashes(video_path):
@@ -50,7 +47,6 @@ def extract_frame_hashes(video_path):
 
     sample_positions = np.linspace(0, total_frames - 1, FRAMES_TO_SAMPLE, dtype=int)
     hashes = []
-
     for pos in sample_positions:
         cap.set(cv2.CAP_PROP_POS_FRAMES, int(pos))
         ret, frame = cap.read()
@@ -63,18 +59,14 @@ def extract_frame_hashes(video_path):
 
 def videos_are_duplicates(hashes1, hashes2):
     if not hashes1 or not hashes2:
-        return False
-    similarities = []
-    for h1, h2 in zip(hashes1, hashes2):
-        similarities.append(similarity_percent(h1, h2))
+        return False, 0
+    similarities = [similarity_percent(h1, h2) for h1, h2 in zip(hashes1, hashes2)]
     avg_similarity = np.mean(similarities)
     return avg_similarity >= SIMILARITY_THRESHOLD, avg_similarity
 
 
 def find_videos(folder):
-    folder = Path(folder)
-    videos = [f for f in folder.rglob('*') if f.suffix.lower() in VIDEO_EXTENSIONS]
-    return sorted(videos)
+    return sorted([f for f in Path(folder).rglob('*') if f.suffix.lower() in VIDEO_EXTENSIONS])
 
 
 def main():
@@ -87,6 +79,9 @@ def main():
         print(f"Error: '{folder}' is not a valid folder.")
         sys.exit(1)
 
+    folder = Path(folder)
+    duplicates_folder = folder / "_duplicates"
+
     print(f"\nScanning: {folder}")
     videos = find_videos(folder)
 
@@ -96,15 +91,11 @@ def main():
 
     print(f"Found {len(videos)} video(s). Analyzing frames...\n")
 
-    # Check for opencv
-    try:
-        import cv2
-    except ImportError:
-        print("Missing dependency. Run: pip install opencv-python numpy")
-        sys.exit(1)
-
     video_hashes = {}
     for i, video in enumerate(videos, 1):
+        # skip anything already in the _duplicates folder
+        if '_duplicates' in video.parts:
+            continue
         print(f"  [{i}/{len(videos)}] {video.name}")
         hashes = extract_frame_hashes(video)
         if hashes:
@@ -134,15 +125,32 @@ def main():
                 duplicate_groups.append({v1, v2})
 
     if not duplicate_groups:
-        print("No duplicate videos found!")
+        print("No duplicate videos found! Nothing moved.")
     else:
-        print(f"Found {len(duplicate_groups)} group(s) of duplicates:\n")
+        print(f"Found {len(duplicate_groups)} group(s) of duplicates.\n")
+        duplicates_folder.mkdir(exist_ok=True)
+        total_moved = 0
+
         for i, group in enumerate(duplicate_groups, 1):
-            print(f"  Duplicate Group {i}:")
-            for v in sorted(group):
-                size_mb = v.stat().st_size / (1024 * 1024)
-                print(f"    - {v.name}  ({size_mb:.1f} MB)")
+            # Keep the largest file, move the rest
+            sorted_group = sorted(group, key=lambda v: v.stat().st_size, reverse=True)
+            keep = sorted_group[0]
+            to_move = sorted_group[1:]
+
+            print(f"  Group {i}:")
+            print(f"    KEEP:  {keep.name}  ({keep.stat().st_size / (1024*1024):.1f} MB)")
+            for v in to_move:
+                dest = duplicates_folder / v.name
+                # avoid overwriting if same filename already in _duplicates
+                if dest.exists():
+                    dest = duplicates_folder / (v.stem + "_dup" + v.suffix)
+                shutil.move(str(v), str(dest))
+                print(f"    MOVED: {v.name}  ({v.stat().st_size / (1024*1024):.1f} MB) -> _duplicates/")
+                total_moved += 1
             print()
+
+        print(f"Done! {total_moved} duplicate(s) moved to: {duplicates_folder}")
+        print("Nothing was deleted — check the _duplicates folder before removing anything.")
 
     print(f"\nTotal videos scanned: {len(video_hashes)}")
     print(f"Duplicate groups found: {len(duplicate_groups)}")
